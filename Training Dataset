@@ -1,0 +1,209 @@
+# =============================================================================
+# RAG Q&A Chatbot with Local Ollama Integration (Model: tinydolphin)
+# =============================================================================
+# Description:
+# This script implements a state-of-the-art Retrieval-Augmented Generation (RAG)
+# system using the 'tinydolphin' local LLM hosted via Ollama. It has been
+# MODIFIED to process a structured CSV ('Training Dataset.csv') by converting
+# each row into a text document for the knowledge base.
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+import ollama
+import time
+
+# --- Configuration ---
+# Using a class for configuration promotes clean code and easy adjustments.
+class RAGConfig:
+    """Configuration settings for the RAG pipeline."""
+    # MODIFIED: Path to your loan application dataset.
+    DATA_PATH = "Training Dataset.csv"
+    # REMOVED: TEXT_COLUMNS is no longer needed as we process rows into documents.
+    EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
+    CHUNK_SIZE = 800      # This can be larger now since documents are smaller.
+    CHUNK_OVERLAP = 100
+    TOP_K_RESULTS = 5
+    # --- Ollama Specific ---
+    OLLAMA_MODEL = 'tinydolphin'
+
+class RAGChatbot:
+    """
+    A RAG-based chatbot that uses a local dataset and a local Ollama model.
+    """
+    def __init__(self, config: RAGConfig):
+        """
+        Initializes the RAG pipeline with a local Ollama model.
+
+        Args:
+            config (RAGConfig): Configuration object.
+        """
+        self.config = config
+        self.embedding_model = None
+        self.vector_store = None
+        self.documents = None
+        self.ollama_client = None
+
+        print(f"Initializing RAG pipeline with local Ollama model: '{self.config.OLLAMA_MODEL}'...")
+        start_time = time.time()
+        self._setup_pipeline()
+        end_time = time.time()
+        print(f"Pipeline ready. Setup took {end_time - start_time:.2f} seconds.")
+
+    def _setup_pipeline(self):
+        """Orchestrates the setup of the entire RAG pipeline."""
+        self.documents = self._load_and_process_data()
+        chunks = self._chunk_documents()
+        self.embedding_model = SentenceTransformer(self.config.EMBEDDING_MODEL)
+        self.vector_store = self._create_vector_store(chunks)
+        self._initialize_ollama_client()
+
+    def _initialize_ollama_client(self):
+        """Initializes and validates the connection to the Ollama client."""
+        print("4/4 - Initializing Ollama client...")
+        try:
+            self.ollama_client = ollama.Client()
+            self.ollama_client.show(self.config.OLLAMA_MODEL)
+            print(f"   - Successfully connected to Ollama and verified model '{self.config.OLLAMA_MODEL}'.")
+        except Exception as e:
+            print(f"   - Error connecting to Ollama: {e}")
+            print(f"   - Please ensure Ollama is running and you have the model with 'ollama run {self.config.OLLAMA_MODEL}'")
+            raise ConnectionError("Could not connect to Ollama.") from e
+
+    def _load_and_process_data(self) -> list:
+        """
+        MODIFIED FUNCTION
+        Loads structured loan data and converts each row into a descriptive text document.
+        This makes the tabular data compatible with the text-based RAG pipeline.
+        """
+        print(f"1/4 - Loading data from '{self.config.DATA_PATH}'...")
+        # Read the entire CSV to process its columns.
+        df = pd.read_csv(self.config.DATA_PATH)
+
+        # Ensure essential columns for creating sentences are handled
+        df.dropna(subset=['Loan_ID', 'Loan_Status'], inplace=True)
+
+        documents = []
+        for _, row in df.iterrows():
+            # Fill any remaining missing values with 'not specified' for a clean sentence.
+            row = row.fillna('not specified')
+            # Create a single text "document" from the data in each row.
+            doc_string = (
+                f"For applicant with Loan ID {row['Loan_ID']}: "
+                f"The applicant is {row['Gender']} and {row['Married']}. They have {row['Dependents']} dependents. "
+                f"Education level is {row['Education']} and they are {row['Self_Employed']}. "
+                f"Applicant income is {row['ApplicantIncome']} and co-applicant income is {row['CoapplicantIncome']}. "
+                f"The loan amount requested is {row['LoanAmount']} for a term of {row['Loan_Amount_Term']} months. "
+                f"Credit history is rated '{row['Credit_History']}' and the property is in a(n) {row['Property_Area']} area. "
+                f"The final approved loan status is: {row['Loan_Status']}."
+            )
+            documents.append(doc_string)
+
+        print(f"   - Loaded and converted {len(documents)} data rows into text documents.")
+        return documents
+
+    def _chunk_documents(self) -> list:
+        """Splits the documents into overlapping chunks."""
+        # Note: Since each document is a short sentence, chunking might be optional.
+        # However, we keep it for consistency with the RAG architecture.
+        print("2/4 - Chunking documents...")
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.config.CHUNK_SIZE,
+            chunk_overlap=self.config.CHUNK_OVERLAP,
+            length_function=len
+        )
+        chunks = text_splitter.split_text('\n\n'.join(self.documents))
+        print(f"   - Created {len(chunks)} text chunks.")
+        return chunks
+
+    def _create_vector_store(self, chunks: list):
+        """Creates a FAISS index from document chunks."""
+        print("3/4 - Embedding chunks and building FAISS index...")
+        embeddings = self.embedding_model.encode(chunks, show_progress_bar=True)
+        embedding_dim = embeddings.shape[1]
+        index = faiss.IndexFlatL2(embedding_dim)
+        index.add(embeddings.astype('float32'))
+        print(f"   - FAISS index created with {index.ntotal} vectors.")
+        return {"index": index, "chunks": chunks}
+
+    def _retrieve_context(self, query: str) -> str:
+        """Retrieves the most relevant context from the vector store."""
+        query_embedding = self.embedding_model.encode([query])
+        _, indices = self.vector_store["index"].search(
+            query_embedding.astype('float32'), self.config.TOP_K_RESULTS
+        )
+        retrieved_chunks = [self.vector_store["chunks"][i] for i in indices[0]]
+        return "\n\n---\n\n".join(retrieved_chunks)
+
+    def answer(self, query: str):
+        """
+        The main method to ask a question and get a RAG-powered answer from Ollama.
+
+        Args:
+            query (str): The user's question.
+
+        Returns:
+            str: The generated answer.
+        """
+        print(f"\n Received Query: \"{query}\"")
+        retrieved_context = self._retrieve_context(query)
+        print("   - Retrieved relevant context from knowledge base.")
+
+        prompt = f"""
+        You are an assistant for querying loan application data. Based ONLY on the following context,
+        please provide a concise answer to the question. The context contains details about loan applicants.
+        If the context does not contain the information, state that you cannot find details for that applicant.
+
+        CONTEXT:
+        {retrieved_context}
+
+        QUESTION:
+        {query}
+        """
+
+        print(f"   - Generating answer with local model '{self.config.OLLAMA_MODEL}'...")
+        try:
+            response = self.ollama_client.chat(
+                model=self.config.OLLAMA_MODEL,
+                messages=[{'role': 'user', 'content': prompt}],
+            )
+            print("!!!!!!!!! Answer generated successfully!!!!!!!!!")
+            return response['message']['content']
+        except Exception as e:
+            error_message = f"An error occurred during answer generation with Ollama: {e}"
+            print(f"   -  {error_message}")
+            return error_message
+
+# =============================================================================
+# Main Execution Block
+# =============================================================================
+if __name__ == '__main__':
+    print("Please ensure the Ollama application is running on your machine.")
+    print(f"You can run the required model with the command: `ollama run tinydolphin`")
+
+    try:
+        config = RAGConfig()
+        chatbot = RAGChatbot(config=config)
+
+        print("\n##!!==============================================!!##")
+        print(f"🤖 RAG Chatbot for Loan Data ('{config.OLLAMA_MODEL}') is now active. Type 'exit' to quit.")
+        print("##!!================================================!!##")
+
+        while True:
+            user_query = input("\nPlease ask your question about a loan applicant: ")
+            if user_query.lower() == 'exit':
+                print("Exiting chatbot. Goodbye!!")
+                break
+            if not user_query.strip():
+                continue
+
+            answer = chatbot.answer(user_query)
+            print(f"\n💡 Answer:\n{answer}")
+
+    except ConnectionError as e:
+        print(f"\nFailed to initialize chatbot: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
